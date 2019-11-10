@@ -4,24 +4,40 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
 	"strings"
+	"time"
 )
+
+// Message holds the information which will be send to the Node `name`
+type Message struct {
+	name string
+	data []byte
+}
 
 // Client holds information about the socket connection and data to be sent.
 type Client struct {
-	socket net.Conn
-	data   chan []byte
+	socket  net.Conn
+	name    string
+	message chan Message
 }
 
 // ClientManager structure will hold all of the available clients, received data,
 // and potential incoming or terminatng clients.
 type ClientManager struct {
 	clients    map[*Client]bool
-	broadcast  chan []byte
+	broadcast  chan Message
 	register   chan *Client
 	unregister chan *Client
+}
+
+func min(x, y int) int {
+	if x > y {
+		return y
+	}
+	return x
 }
 
 // start() goroutine will run for lifespan of the server.
@@ -42,26 +58,30 @@ type ClientManager struct {
 func (manager *ClientManager) start() {
 	for {
 		select {
-		case connection := <-manager.register:
-			manager.clients[connection] = true
+		case conn := <-manager.register:
+			manager.clients[conn] = true
 
-			address := connection.socket.RemoteAddr().String()
-			fmt.Println("Added new connection", address)
-		case connection := <-manager.unregister:
-			if _, ok := manager.clients[connection]; ok {
-				close(connection.data)
-				delete(manager.clients, connection)
+			address := conn.socket.RemoteAddr().String()
+			fmt.Println("Added new connection", address, "Name: ", conn.name)
 
-				address := connection.socket.RemoteAddr().String()
-				fmt.Println("A connection is terminated", address)
+		case conn := <-manager.unregister:
+			if _, ok := manager.clients[conn]; ok {
+				close(conn.message)
+				delete(manager.clients, conn)
+
+				address := conn.socket.RemoteAddr().String()
+				fmt.Println("A connection is terminated", address, "Name: ", conn.name)
 			}
+
 		case message := <-manager.broadcast:
-			for connection := range manager.clients {
-				select {
-				case connection.data <- message:
-				default:
-					close(connection.data)
-					delete(manager.clients, connection)
+			for conn := range manager.clients {
+				if conn.name == message.name {
+					select {
+					case conn.message <- message:
+					default:
+						close(conn.message)
+						delete(manager.clients, conn)
+					}
 				}
 			}
 		}
@@ -91,7 +111,13 @@ func (manager *ClientManager) receive(client *Client) {
 		// to be distributed to all client by the manager.
 		if length > 0 {
 			fmt.Println("Received:", string(message))
-			manager.broadcast <- message
+
+			var name, str string
+			fmt.Sscanf(string(message), "%s %q", &name, &str)
+			manager.broadcast <- Message{
+				name: name,
+				data: []byte(str),
+			}
 		}
 	}
 }
@@ -102,11 +128,11 @@ func (manager *ClientManager) send(client *Client) {
 	defer client.socket.Close()
 	for {
 		select {
-		case message, ok := <-client.data:
+		case message, ok := <-client.message:
 			if !ok {
 				return
 			}
-			client.socket.Write(message)
+			client.socket.Write(message.data)
 		}
 	}
 }
@@ -120,23 +146,27 @@ func startServerMode() {
 
 	manager := ClientManager{
 		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 1),
+		broadcast:  make(chan Message),
 		register:   make(chan *Client, 1),
 		unregister: make(chan *Client, 1),
 	}
 
 	go manager.start()
 
-	for {
+	clientNames := [7]string{"A", "B", "C", "D", "E", "F", "G"}
+
+	for i := 0; i < len(clientNames); i++ {
 		connection, err := listener.Accept()
 		if err != nil {
 			fmt.Println(err)
 		}
 
 		client := &Client{
-			socket: connection,
-			data:   make(chan []byte),
+			socket:  connection,
+			name:    clientNames[i],
+			message: make(chan Message, 1),
 		}
+
 		manager.register <- client
 
 		go manager.receive(client)
@@ -176,10 +206,39 @@ func startClientMode() {
 	client := &Client{socket: conn}
 	go client.receive()
 
+	fmt.Println("Your ip: ", conn.LocalAddr().String())
+	fmt.Println("<Category> <Node Name> \"<Message>\"")
+	fmt.Println("Category:\n1 = Send file\n2 = Send text")
 	for {
 		reader := bufio.NewReader(os.Stdin)
 		message, _ := reader.ReadString('\n')
-		conn.Write([]byte(strings.TrimRight(message, "\n")))
+
+		var category int // 1 => Send a file; 2 => Send text
+		var name, str string
+
+		fmt.Sscanf(string(message), "%d %s %q", &category, &name, &str)
+		if category == 1 {
+			data, err := ioutil.ReadFile(str)
+			if err != nil {
+				fmt.Println("File reading error", err)
+			} else {
+				filePath := str
+				str := string(data)
+				chunkSize := 1024 / 8
+				chunks := len(str) / chunkSize
+				fmt.Printf("Read the file '%s' and divided into %d chunks.\n", filePath, chunks+1)
+				for i := 0; i < chunks+1; i++ {
+					fmt.Printf("Sending chunk %d\n", i)
+					message := string(name + " \"" + str[(i*chunkSize):min((i+1)*chunkSize, len(str))] + "\"")
+					conn.Write([]byte(strings.TrimRight(message, "\n")))
+					time.Sleep(300 * time.Millisecond)
+				}
+			}
+		} else {
+			message := string(name + " \"" + str + "\"")
+			conn.Write([]byte(strings.TrimRight(message, "\n")))
+		}
+
 	}
 }
 
